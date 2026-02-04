@@ -1,0 +1,23 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# STM32CubeIDE / Eclipse
+.metadata/
+.settings/
+*.launch
+*.log
+
+# Build outputs
+Debug/
+Release/
+build/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+
+# CubeMX backups
+*.ioc.bak
