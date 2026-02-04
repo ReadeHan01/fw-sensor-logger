@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -98,9 +98,12 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-	  HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-	  HAL_Delay(200);
+
     /* USER CODE BEGIN 3 */
+	  const char msg[] = "Hello from STM32\r\n";
+	  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+	  HAL_Delay(1000);
+
   }
   /* USER CODE END 3 */
 }
