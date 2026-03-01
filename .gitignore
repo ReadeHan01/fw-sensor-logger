@@ -1,0 +1,24 @@
+# ---- Build outputs ----
+Debug/
+Release/
+*/Debug/
+*/Release/
+*.o
+*.a
+*.elf
+*.map
+*.lst
+*.d
+*.su
+*.bin
+*.hex
+
+# ---- STM32CubeIDE / Eclipse ----
+.metadata/
+.settings/
+*.launch
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
