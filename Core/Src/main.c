@@ -18,13 +18,12 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <stdint.h>   // fixed-size ints like uint16_t, uint32_t
-#include <string.h>   // strlen() for UART string length
-#include <stdio.h>    // snprintf() for formatting text
-#include <math.h>     // lroundf() for rounding temperature
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,10 +50,12 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+TIM_HandleTypeDef htim2;
+
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+volatile uint8_t interrupt_flag = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -63,6 +64,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -78,7 +80,7 @@ static void uart_print(const char *msg)
 // Read one ADC conversion result (polling). This returns HAL_OK / HAL_TIMEOUT / HAL_ERROR.
 static HAL_StatusTypeDef adc_poll_get(uint16_t *out)
 {
-  if (HAL_ADC_PollForConversion(&hadc1, 20) != HAL_OK) {
+  if (HAL_ADC_PollForConversion(&hadc1, 200) != HAL_OK) {
     return HAL_TIMEOUT;
   }
   *out = (uint16_t)HAL_ADC_GetValue(&hadc1);
@@ -96,8 +98,8 @@ int main(void)
   /* USER CODE BEGIN 1 */
 	// last_blink: last time I toggled the LED (ms)
 	// last_print: last time I printed to UART (ms)
-	uint32_t last_blink = 0;
-	uint32_t last_print = 0;
+	//uint32_t last_blink = 0;
+	//uint32_t last_print = 0;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -121,111 +123,113 @@ int main(void)
   MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-
+  HAL_TIM_Base_Start_IT(&htim2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while(1){
-	  uint32_t now = HAL_GetTick();
+	  if(interrupt_flag){
+		  interrupt_flag--;
+		  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+			    uint16_t therm_adc = 0;
+			    uint16_t temp_adc  = 0;
+			    uint16_t vref_adc  = 0;
+			    uint16_t ldr_adc   = 0;
 
-	  if ((now - last_blink) >= 1000) {
-	    last_blink = now;
-	    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+
+			    char msg[160];
+
+			    // 1) Start ADC scan sequence (Rank1 -> Rank2 -> Rank3)
+			    if (HAL_ADC_Start(&hadc1) != HAL_OK) {
+			      uart_print("ADC start error\r\n");
+			    } else {
+			      // 2) Read Rank 1 (thermistor)
+			      if (adc_poll_get(&therm_adc) != HAL_OK) {
+			        HAL_ADC_Stop(&hadc1);
+			        uart_print("ADC timeout (rank1)\r\n");
+			        continue; //start while loop again
+			      }
+
+			      if (adc_poll_get(&ldr_adc) != HAL_OK) {
+			        HAL_ADC_Stop(&hadc1);
+			        uart_print("ADC timeout (rank2)\r\n");
+			        continue; //start while loop again
+			      }
+
+			      // 3) Read Rank 2 (internal temp sensor)
+			      if (adc_poll_get(&temp_adc) != HAL_OK) {
+			        HAL_ADC_Stop(&hadc1);
+			        uart_print("ADC timeout (rank3)\r\n");
+			        continue; //start while loop again
+			      }
+
+			      // 4) Read Rank 3 (vrefint)
+			      if (adc_poll_get(&vref_adc) != HAL_OK) {
+			        HAL_ADC_Stop(&hadc1);
+			        uart_print("ADC timeout (rank4)\r\n");
+			        continue; //start while loop again
+			      }
+
+			      // 5) Stop ADC (so it only runs when we ask)
+			      HAL_ADC_Stop(&hadc1);
+
+			      // ---- Calculate VDDA using Vrefint ----
+			      // VDDA = (VrefInt * 4095) / vref_adc
+			      float vdda = 3.3f;
+			      if (vref_adc != 0) {
+			        vdda = (VrefInt * 4095.0f) / (float)vref_adc;
+			      }
+			      if (therm_adc == 0 || therm_adc == 4095){
+			    	  	HAL_ADC_Stop(&hadc1);
+				        continue; //start while loop again
+			      }
+
+			      // ---- Convert internal temp sensor adc to temperature ----
+			      // 1) therm_adc -> Vout
+			      float vout = (therm_adc * vdda) / 4095.0f;
+
+			      // 2) Vout -> Rth (케이스 A 예시)
+			      float rth = R_FIXED * (vdda / vout - 1.0f);
+
+			      // 3) Rth -> TempC (Beta)
+			      float t0 = 298.15f;      // 25C in Kelvin
+			      float tempK = 1.0f / ( (1.0f/t0) + (1.0f/BETA)*logf(rth / R0) );
+			      float tempC = tempK - 273.15f;
+			      // Vsense = temp_adc * VDDA / 4095
+			      float vsense = ((float)temp_adc * vdda) / 4095.0f;
+
+			      // TempC = 25 + (V25 - Vsense) / AvgSlope
+			      float temp_c = (Voltage_25 - vsense) / AvgSlope + 25.0f;
+
+			      // temp_x10 = temperature * 10 (example: 23.7°C -> 237)
+			      int16_t temp_x10 = (int16_t)lroundf(temp_c * 10.0f);
+
+			      // Print temp_x10 as X.Y
+			      int16_t whole = temp_x10 / 10;
+			      int16_t frac  = (temp_x10 < 0 ? -temp_x10 : temp_x10) % 10; //convert frac to absolute value to avoid printing - before the value
+
+			      snprintf(msg, sizeof(msg),
+			               "therm_adc=%u | temp_adc=%u | vref_adc=%u | VDDA=%.3fV | T=%d.%01dC | therm_C = %.2f | ldr_adc = %u\r\n",
+			               (unsigned)therm_adc,
+			               (unsigned)temp_adc,
+			               (unsigned)vref_adc,
+			               (double)vdda,
+			               (int)whole, (int)frac, (float) tempC,
+						   (unsigned)ldr_adc);
+
+			      uart_print(msg);
+			    }
+
 	  }
-
-	  if ((now - last_print) >= 1000) {
-	    last_print = now;
-
-	    uint16_t therm_adc = 0;
-	    uint16_t temp_adc  = 0;
-	    uint16_t vref_adc  = 0;
-
-	    char msg[160];
-
-	    // 1) Start ADC scan sequence (Rank1 -> Rank2 -> Rank3)
-	    if (HAL_ADC_Start(&hadc1) != HAL_OK) {
-	      uart_print("ADC start error\r\n");
-	    } else {
-	      // 2) Read Rank 1 (thermistor)
-	      if (adc_poll_get(&therm_adc) != HAL_OK) {
-	        HAL_ADC_Stop(&hadc1);
-	        uart_print("ADC timeout (rank1)\r\n");
-	        continue; //start while loop again
-	      }
-
-	      // 3) Read Rank 2 (internal temp sensor)
-	      if (adc_poll_get(&temp_adc) != HAL_OK) {
-	        HAL_ADC_Stop(&hadc1);
-	        uart_print("ADC timeout (rank2)\r\n");
-	        continue; //start while loop again
-	      }
-
-	      // 4) Read Rank 3 (vrefint)
-	      if (adc_poll_get(&vref_adc) != HAL_OK) {
-	        HAL_ADC_Stop(&hadc1);
-	        uart_print("ADC timeout (rank3)\r\n");
-	        continue; //start while loop again
-	      }
-
-	      // 5) Stop ADC (so it only runs when we ask)
-	      HAL_ADC_Stop(&hadc1);
-
-	      // ---- Calculate VDDA using Vrefint ----
-	      // VDDA = (VrefInt * 4095) / vref_adc
-	      float vdda = 3.3f;
-	      if (vref_adc != 0) {
-	        vdda = (VrefInt * 4095.0f) / (float)vref_adc;
-	      }
-	      if (therm_adc == 0 || therm_adc == 4095){
-	    	  	HAL_ADC_Stop(&hadc1);
-		        continue; //start while loop again
-	      }
-
-	      // ---- Convert internal temp sensor adc to temperature ----
-	      // 1) therm_adc -> Vout
-	      float vout = (therm_adc * vdda) / 4095.0f;
-
-	      // 2) Vout -> Rth (케이스 A 예시)
-	      float rth = R_FIXED * (vdda / vout - 1.0f);
-
-	      // 3) Rth -> TempC (Beta)
-	      float t0 = 298.15f;      // 25C in Kelvin
-	      float tempK = 1.0f / ( (1.0f/t0) + (1.0f/BETA)*logf(rth / R0) );
-	      float tempC = tempK - 273.15f;
-	      // Vsense = temp_adc * VDDA / 4095
-	      float vsense = ((float)temp_adc * vdda) / 4095.0f;
-
-	      // TempC = 25 + (V25 - Vsense) / AvgSlope
-	      float temp_c = (Voltage_25 - vsense) / AvgSlope + 25.0f;
-
-	      // temp_x10 = temperature * 10 (example: 23.7°C -> 237)
-	      int16_t temp_x10 = (int16_t)lroundf(temp_c * 10.0f);
-
-	      // Print temp_x10 as X.Y
-	      int16_t whole = temp_x10 / 10;
-	      int16_t frac  = (temp_x10 < 0 ? -temp_x10 : temp_x10) % 10; //convert frac to absolute value to avoid printing - before the value
-
-	      snprintf(msg, sizeof(msg),
-	               "t=%lu | therm_adc=%u | temp_adc=%u | vref_adc=%u | VDDA=%.3fV | T=%d.%01dC | therm_C = %.2f\r\n",
-	               (unsigned long)now,
-	               (unsigned)therm_adc,
-	               (unsigned)temp_adc,
-	               (unsigned)vref_adc,
-	               (double)vdda,
-	               (int)whole, (int)frac, (float) tempC);
-
-	      uart_print(msg);
-	    }
-	  }
-    }
   }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   /* USER CODE END 3 */
-
+}
 
 /**
   * @brief System Clock Configuration
@@ -303,7 +307,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 3;
+  hadc1.Init.NbrOfConversion = 4;
   hadc1.Init.DMAContinuousRequests = DISABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -323,7 +327,7 @@ static void MX_ADC1_Init(void)
 
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
-  sConfig.Channel = ADC_CHANNEL_TEMPSENSOR;
+  sConfig.Channel = ADC_CHANNEL_4;
   sConfig.Rank = 2;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
@@ -332,8 +336,17 @@ static void MX_ADC1_Init(void)
 
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
-  sConfig.Channel = ADC_CHANNEL_VREFINT;
+  sConfig.Channel = ADC_CHANNEL_TEMPSENSOR;
   sConfig.Rank = 3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_VREFINT;
+  sConfig.Rank = 4;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -341,6 +354,51 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 8399;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -433,7 +491,13 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM2)
+  {
+    interrupt_flag++;   // keep ISR tiny
+  }
+}
 /* USER CODE END 4 */
 
 /**
