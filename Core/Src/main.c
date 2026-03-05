@@ -24,12 +24,10 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 /* USER CODE END Includes */
 
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
 
-/* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
@@ -39,7 +37,29 @@
 #define R_FIXED 10000
 #define BETA 3950
 #define R0 10000
+
+#define RB_CAPACITY 512u
+#define RB_MASK (RB_CAPACITY - 1u)
 /* USER CODE END PD */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+// My sample type
+typedef struct {
+    uint32_t timestamp_ms; // e.g., HAL_GetTick()
+    float    temp1;
+    float    temp2;
+} Sample;
+
+// Ring buffer
+typedef struct{
+	Sample buf[RB_CAPACITY];
+	uint16_t head;
+	uint16_t tail;
+	uint16_t count;
+	uint32_t overwrites;
+} Ring;
+/* USER CODE END PTD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
@@ -56,6 +76,7 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 volatile uint8_t interrupt_flag = 0;
+static Ring ringbuffer;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -65,6 +86,7 @@ static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
+
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -86,7 +108,93 @@ static HAL_StatusTypeDef adc_poll_get(uint16_t *out)
   *out = (uint16_t)HAL_ADC_GetValue(&hadc1);
   return HAL_OK;
 }
+
+/* =======================
+   Critical section helpers
+   ======================= */
+// Works on Cortex-M: PRIMASK disable/enable interrupts.
+static inline uint32_t rb_enter_critical(void) {
+    uint32_t primask;
+    __asm volatile ("MRS %0, PRIMASK" : "=r" (primask) );
+    __asm volatile ("CPSID i");
+    return primask;
+}
+
+static inline void rb_exit_critical(uint32_t primask) {
+    __asm volatile ("MSR PRIMASK, %0" :: "r" (primask) );
+}
+
+static inline void rb_init(Ring *rb){
+	memset(rb, 0, sizeof(*rb));
+}
+
+/* =======================
+   Push (overwrite oldest if full)
+   Producer: typically ISR
+   ======================= */
+static inline void rb_push_overwrite(Ring *rb, const Sample *s){
+	uint32_t key = rb_enter_critical();
+
+	rb->buf[rb->head] = *s;
+	rb->head = (rb->head + 1u) & RB_MASK;
+
+	if(rb->count < RB_CAPACITY){
+		rb->count++;
+	} else{
+		rb->tail = (rb->tail +1u) & RB_MASK;
+		rb->overwrites++;
+	}
+	rb_exit_critical(key);
+}
+/* =======================
+   Pop
+   Consumer: typically main loop
+   returns true if got a sample
+   ======================= */
+static inline bool rb_pop(Ring *rb, Sample *out){
+	uint32_t key = rb_enter_critical();
+	if(rb->count == 0u){
+		rb_exit_critical(key);
+		return false;
+	}
+
+	*out = rb->buf[rb->tail];
+    rb->tail = (rb->tail + 1u) & RB_MASK;
+    rb->count--;
+
+	rb_exit_critical(key);
+	return true;
+}
+
+static bool read_therm_and_ldr(float *therm_c, float *ldr_pct)
+{
+  uint16_t therm_adc = 0, ldr_adc = 0;
+
+  if (HAL_ADC_Start(&hadc1) != HAL_OK) return false;
+
+  if (adc_poll_get(&therm_adc) != HAL_OK) { HAL_ADC_Stop(&hadc1); return false; } // Rank1
+  if (adc_poll_get(&ldr_adc)  != HAL_OK) { HAL_ADC_Stop(&hadc1); return false; } // Rank2
+
+  HAL_ADC_Stop(&hadc1);
+
+  if (therm_adc == 0 || therm_adc == 4095) return false;
+
+  // --- thermistor convert (add clamp) ---
+  float v = (therm_adc * 3.3f) / 4095.0f;
+  if (v < 0.001f) v = 0.001f;
+  if (v > 3.299f) v = 3.299f;
+
+  float rth = R_FIXED * (3.3f / v - 1.0f);
+  float t0 = 298.15f;
+  float tempK = 1.0f / ((1.0f/t0) + (1.0f/BETA)*logf(rth / R0));
+  *therm_c = tempK - 273.15f;
+
+  *ldr_pct = ((float)ldr_adc / 4095.0f) * 100.0f;
+  return true;
+}
 /* USER CODE END 0 */
+
+
 
 /**
   * @brief  The application entry point.
@@ -100,6 +208,8 @@ int main(void)
 	// last_print: last time I printed to UART (ms)
 	//uint32_t last_blink = 0;
 	//uint32_t last_print = 0;
+  char line[128];
+  Sample s;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -108,7 +218,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  rb_init(&ringbuffer);
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -131,6 +241,21 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while(1){
+	  if(interrupt_flag){
+		  interrupt_flag--;
+		    s.timestamp_ms = HAL_GetTick();
+
+		    if(read_therm_and_ldr(&s.temp1, &s.temp2)){
+		    rb_push_overwrite(&ringbuffer, &s);
+		    }
+	  }
+    while (rb_pop(&ringbuffer, &s)){
+      snprintf(line, sizeof(line), "timestamp_ms = %lu, thermistor = %.2f, Photoresistor = %.2f%%\r\n", s.timestamp_ms, s.temp1, s.temp2);
+      uart_print(line);
+    }
+        HAL_Delay(1);
+        //------------------
+        /*
 	  if(interrupt_flag){
 		  interrupt_flag--;
 		  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
@@ -224,6 +349,7 @@ int main(void)
 			    }
 
 	  }
+          */
   }
     /* USER CODE END WHILE */
 
@@ -495,7 +621,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM2)
   {
-    interrupt_flag++;   // keep ISR tiny
+	interrupt_flag++;
   }
 }
 /* USER CODE END 4 */
@@ -531,3 +657,4 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+
