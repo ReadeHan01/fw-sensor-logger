@@ -8,14 +8,14 @@ Timer interrupt–based sampling
 - Read ADC in the main loop
 - Store sampled values in RAM
 
-🟡 v3 (next)
+🟢 v3 (done)
 Add ring buffer
 
 - struct Sample { timestamp, temp1, temp2 }
 - Implement circular buffer
 - Handle buffer full condition (overwrite or drop)
 
-🔵 v4
+🔵 v4 (next)
 UART CLI
 
 - Receive string input
