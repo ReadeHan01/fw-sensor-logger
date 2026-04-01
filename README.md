@@ -23,7 +23,7 @@ UART CLI
 - Print system status
 - Example commands: `status`, `start`, `stop`
 
-🔴 v5 (next)
+🟢 v5 (done)
 Reliability layer
 
 - Watchdog timer
