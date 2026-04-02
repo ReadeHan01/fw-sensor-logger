@@ -1,6 +1,6 @@
 <div align="center">
 
-# `fw_sensor_logger_rebuild`
+# `fw_sensor_logger`
 
 ![MCU](https://img.shields.io/badge/MCU-STM32F446RETx-03a9f4?style=flat-square&logo=stmicroelectronics&logoColor=white)
 ![UART](https://img.shields.io/badge/UART-115200%208N1-4caf50?style=flat-square)
